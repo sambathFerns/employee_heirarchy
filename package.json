@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
    "build": "next build --webpack",
+    "build:cloudflare": "opennextjs-cloudflare build",
     "deploy": "npm run build && npx opennextjs-cloudflare build && wrangler deploy",
     "start": "next start",
     "lint": "eslint"
