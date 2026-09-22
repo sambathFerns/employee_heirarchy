@@ -19,7 +19,7 @@ import "@xyflow/react/dist/style.css";
 import "../style/hierarchy.css";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { FiExternalLink, FiEye, FiX } from "react-icons/fi";
+import { FiExternalLink, FiEye, FiMove, FiX } from "react-icons/fi";
 
 type UserStatus = "FILLED" | "VACANT" | "RECRUITING";
 
@@ -101,6 +101,8 @@ type ShowOptions = {
 type UserHierarchyProps = {
   showOptions: ShowOptions;
 };
+
+type PositionMap = Record<string, { x: number; y: number }>;
 
 /* =========================================================
    HIERARCHY JSON
@@ -518,13 +520,7 @@ const usersById = new Map(users.map((user) => [user.id, user]));
    DEFAULT OVERVIEW POSITIONS
 ========================================================= */
 
-const positions: Record<
-  string,
-  {
-    x: number;
-    y: number;
-  }
-> = {
+const positions: PositionMap = {
   "node-001": {
     x: 650,
     y: 20,
@@ -618,6 +614,8 @@ const FOCUS_CHILD_SPACING = 220;
 const FOCUS_CENTER_X = 650;
 
 const NODE_WIDTH = 240;
+
+const LAYOUT_STORAGE_KEY = "hierarchy-node-positions";
 
 /* =========================================================
    STATUS
@@ -936,6 +934,8 @@ function buildOverviewNodes(
   showOptions: ShowOptions,
   visibleEdges: Edge[],
   onViewProfile?: (user: User) => void,
+  customPositions: PositionMap = {},
+  draggable: boolean = false,
 ): Node[] {
   return users
     .filter(
@@ -949,11 +949,14 @@ function buildOverviewNodes(
 
         type: "user",
 
-        position: positions[user.id],
+        // Custom (dragged + saved) position takes priority over the default layout.
+        position: customPositions[user.id] ?? positions[user.id],
 
         data,
 
         selected: false,
+
+        draggable,
 
         className: data.hasChildren ? undefined : "no-children-node",
       };
@@ -1056,6 +1059,36 @@ export default function UserHierarchy({ showOptions }: UserHierarchyProps) {
 
   const [rfInstance, setRfInstance] = useState<ReactFlowInstance | null>(null);
 
+  /* =======================================================
+     DRAG / LAYOUT EDITING STATE
+
+     - isDragMode: when true, nodes can be repositioned and the
+       "drill into" click behaviour is disabled.
+     - savedPositions: the last persisted custom layout (used to
+       render the overview whenever we are NOT actively dragging).
+     - isDirty: true once the user has moved at least one node
+       since entering drag mode / since the last save.
+  ======================================================= */
+
+  const [isDragMode, setIsDragMode] = useState(false);
+
+  const [savedPositions, setSavedPositions] = useState<PositionMap>({});
+
+  const [isDirty, setIsDirty] = useState(false);
+
+  // Load any previously saved layout on mount.
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(LAYOUT_STORAGE_KEY);
+
+      if (stored) {
+        setSavedPositions(JSON.parse(stored));
+      }
+    } catch (error) {
+      console.error("Failed to load saved node positions:", error);
+    }
+  }, []);
+
   useEffect(() => {
     console.log({ selectedProfile });
   }, [selectedProfile]);
@@ -1110,6 +1143,11 @@ export default function UserHierarchy({ showOptions }: UserHierarchyProps) {
 
   /* =======================================================
      REBUILD NODES
+
+     Rebuilds whenever the view (focused node / filters) or the
+     saved layout changes. It intentionally does NOT depend on
+     `nodes` itself, so in-progress dragging (handled by
+     onNodesChange below) is never clobbered mid-drag.
   ======================================================= */
 
   useEffect(() => {
@@ -1120,10 +1158,23 @@ export default function UserHierarchy({ showOptions }: UserHierarchyProps) {
           visibleEdges,
           handleViewProfile,
         )
-      : buildOverviewNodes(showOptions, visibleEdges, handleViewProfile);
+      : buildOverviewNodes(
+          showOptions,
+          visibleEdges,
+          handleViewProfile,
+          savedPositions,
+          isDragMode,
+        );
 
     setNodes(nextNodes);
-  }, [focusedNodeId, showOptions, setNodes, handleViewProfile]);
+  }, [
+    focusedNodeId,
+    showOptions,
+    setNodes,
+    handleViewProfile,
+    savedPositions,
+    isDragMode,
+  ]);
 
   /* =======================================================
      FIT VIEW
@@ -1131,6 +1182,12 @@ export default function UserHierarchy({ showOptions }: UserHierarchyProps) {
 
   useEffect(() => {
     if (!rfInstance) {
+      return;
+    }
+
+    // Don't fight the user's own dragging by re-fitting the view
+    // every time a node position changes while editing the layout.
+    if (isDragMode) {
       return;
     }
 
@@ -1147,7 +1204,7 @@ export default function UserHierarchy({ showOptions }: UserHierarchyProps) {
     });
 
     return () => cancelAnimationFrame(raf);
-  }, [nodes, rfInstance]);
+  }, [nodes, rfInstance, isDragMode]);
 
   /* =======================================================
      DRAG
@@ -1157,7 +1214,77 @@ export default function UserHierarchy({ showOptions }: UserHierarchyProps) {
     console.log("Dragged node:", node.id);
 
     console.log("New position:", node.position);
+
+    setIsDirty(true);
   }, []);
+
+  /* =======================================================
+     DRAG MODE / SAVE / CANCEL
+  ======================================================= */
+
+  const handleToggleDragMode = useCallback(() => {
+    setIsDragMode((current) => {
+      if (current) {
+        // Turning drag mode off: if there are unsaved moves, make the
+        // user explicitly choose Save/Discard below rather than
+        // silently losing (or keeping) their changes.
+        if (isDirty) {
+          return current;
+        }
+
+        return false;
+      }
+
+      // Entering edit mode: leave the drilled-in view, since
+      // drilling is disabled while repositioning nodes.
+      setFocusedNodeId(null);
+
+      return true;
+    });
+  }, [isDirty]);
+
+  const handleSavePositions = useCallback(() => {
+    setNodes((currentNodes) => {
+      const nextPositions: PositionMap = { ...savedPositions };
+
+      currentNodes.forEach((node) => {
+        nextPositions[node.id] = node.position;
+      });
+
+      setSavedPositions(nextPositions);
+
+      try {
+        window.localStorage.setItem(
+          LAYOUT_STORAGE_KEY,
+          JSON.stringify(nextPositions),
+        );
+      } catch (error) {
+        console.error("Failed to save node positions:", error);
+      }
+
+      return currentNodes;
+    });
+
+    setIsDirty(false);
+    setIsDragMode(false);
+  }, [savedPositions, setNodes]);
+
+  const handleCancelPositions = useCallback(() => {
+    // Discard any unsaved dragging by rebuilding from the last
+    // saved layout.
+    setNodes(
+      buildOverviewNodes(
+        showOptions,
+        visibleEdges,
+        handleViewProfile,
+        savedPositions,
+        false,
+      ),
+    );
+
+    setIsDirty(false);
+    setIsDragMode(false);
+  }, [handleViewProfile, savedPositions, setNodes, showOptions, visibleEdges]);
 
   /* =======================================================
      SNACKBAR
@@ -1194,6 +1321,12 @@ export default function UserHierarchy({ showOptions }: UserHierarchyProps) {
 
   const onNodeClick: NodeMouseHandler = useCallback(
     (_event, node) => {
+      // Drilling into a node is disabled while drag mode is on,
+      // so a click just leaves the node selected/draggable.
+      if (isDragMode) {
+        return;
+      }
+
       setFocusedNodeId((current) => {
         if (current === node.id) {
           return null;
@@ -1210,7 +1343,7 @@ export default function UserHierarchy({ showOptions }: UserHierarchyProps) {
         return node.id;
       });
     },
-    [showNothingUnderSnackbar],
+    [isDragMode, showNothingUnderSnackbar],
   );
 
   /* =======================================================
@@ -1218,8 +1351,12 @@ export default function UserHierarchy({ showOptions }: UserHierarchyProps) {
   ======================================================= */
 
   const onPaneClick = useCallback(() => {
+    if (isDragMode) {
+      return;
+    }
+
     setFocusedNodeId(null);
-  }, []);
+  }, [isDragMode]);
 
   /* =======================================================
      DISPLAY EDGES
@@ -1245,7 +1382,7 @@ export default function UserHierarchy({ showOptions }: UserHierarchyProps) {
       <div className="hierarchy-header">
         <h1>User Hierarchy</h1>
 
-        {focusedNodeId && (
+        {focusedNodeId && !isDragMode && (
           <button
             type="button"
             className="back-to-overview"
@@ -1299,9 +1436,9 @@ export default function UserHierarchy({ showOptions }: UserHierarchyProps) {
             onNodeClick={onNodeClick}
             onPaneClick={onPaneClick}
             onInit={setRfInstance}
-            nodesDraggable={false}
+            nodesDraggable={isDragMode}
             nodesConnectable={false}
-            elementsSelectable={false}
+            elementsSelectable={isDragMode}
             fitView
             fitViewOptions={{
               padding: 0.35,
@@ -1326,6 +1463,55 @@ export default function UserHierarchy({ showOptions }: UserHierarchyProps) {
 
             {/* <MiniMap /> */}
           </ReactFlow>
+
+          <div className="layout-floating-panel">
+            <button
+              type="button"
+              className={`icon-button drag-toggle-button ${
+                isDragMode ? "active" : ""
+              }`}
+              onClick={handleToggleDragMode}
+              aria-label={
+                isDragMode
+                  ? "Exit drag mode"
+                  : "Drag to reposition nodes"
+              }
+              aria-pressed={isDragMode}
+              data-tooltip={
+                isDragMode
+                  ? isDirty
+                    ? "Save or discard your changes to exit"
+                    : "Click to exit drag mode"
+                  : "Drag to reposition nodes"
+              }
+            >
+              <FiMove size={16} />
+            </button>
+
+            {isDragMode && isDirty && (
+              <div className="layout-confirm">
+                <span className="layout-confirm-text">
+                  Want to save this layout?
+                </span>
+
+                <button
+                  type="button"
+                  className="text-button text-button-primary"
+                  onClick={handleSavePositions}
+                >
+                  Yes, save
+                </button>
+
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={handleCancelPositions}
+                >
+                  No, discard
+                </button>
+              </div>
+            )}
+          </div>
         </div>
 
         {selectedProfile && (
